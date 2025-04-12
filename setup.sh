@@ -1,45 +1,70 @@
 #!/bin/bash
 
-# Requer sudo
+LOG_FILE="setup.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Verifica se é root
 if [ "$EUID" -ne 0 ]; then
-  echo "Por favor, execute como root: sudo ./setup.sh"
-  exit
+  echo "🚫 Por favor, execute como root: sudo ./setup.sh"
+  exit 1
 fi
 
-# 📩 Solicita e-mail e senha
+echo "🔧 Iniciando configuração do ambiente..."
+
+# Solicita Parsec (seguro, com arquivo temporário)
 read -p "Digite seu e-mail do Parsec: " PARSEC_EMAIL
 read -s -p "Digite sua senha do Parsec: " PARSEC_PASSWORD
 echo
 
-# 🧠 RAM personalizada
+TMP_SECRET_FILE="/tmp/parsec.secret"
+echo "$PARSEC_EMAIL" > "$TMP_SECRET_FILE"
+echo "$PARSEC_PASSWORD" >> "$TMP_SECRET_FILE"
+
+# Entrada de RAM com validação
 read -p "Quanto de RAM deseja alocar para o Windows (GB)? [Padrão: 10] " RAM_INPUT
 RAM_INPUT=${RAM_INPUT:-10}
+if ! [[ "$RAM_INPUT" =~ ^[0-9]+$ ]]; then
+  echo "❌ Valor inválido. Usando 10 GB."
+  RAM_INPUT=10
+fi
 if [[ "$RAM_INPUT" -gt 12 ]]; then
-  echo "⚠️  Máximo permitido é 12 GB. Usando 12."
+  echo "⚠️ Máximo permitido é 12 GB. Usando 12."
   RAM_INPUT=12
 fi
 RAM_SIZE="${RAM_INPUT}G"
 
-# 🧠 CPU personalizada
+# Entrada de CPU com validação
 read -p "Quantos núcleos de CPU deseja alocar? [Padrão: 4] " CPU_INPUT
 CPU_INPUT=${CPU_INPUT:-4}
+if ! [[ "$CPU_INPUT" =~ ^[0-9]+$ ]]; then
+  echo "❌ Valor inválido. Usando 4 núcleos."
+  CPU_INPUT=4
+fi
 if [[ "$CPU_INPUT" -gt 4 ]]; then
-  echo "⚠️  Máximo permitido são 4 núcleos. Usando 4."
+  echo "⚠️ Máximo permitido são 4 núcleos. Usando 4."
   CPU_INPUT=4
 fi
 CPU_CORES="$CPU_INPUT"
 
 # Instala Docker e Compose
+echo "📦 Instalando Docker e Docker Compose..."
 apt update && apt install -y docker.io docker-compose
+
 systemctl start docker
 systemctl enable docker
 
-# Cria estrutura
+# Estrutura de diretórios
 mkdir -p ~/dockercom/scripts
-cd ~/dockercom
+cd ~/dockercom || exit 1
 
-# Cria docker-compose com RAM e CPU personalizados
-cat <<EOF > windows10.yml
+# Se o container já existir, evita recriação
+if docker ps -a --format '{{.Names}}' | grep -q "^windows$"; then
+  echo "⚠️ Container 'windows' já existe. Pulando criação."
+else
+  # Criação do docker-compose com os parâmetros
+  echo "📝 Gerando arquivo docker-compose..."
+
+  cat <<EOF > windows10.yml
 services:
   windows:
     image: dockurr/windows
@@ -66,77 +91,77 @@ services:
     stop_grace_period: 2m
 EOF
 
-# Verifica se é a primeira execução
-if [ ! -f "/parsecsetup/first_run.flag" ]; then
-  echo "Primeira execução detectada. Realizando configurações iniciais..."
+  # Verifica se é primeira execução
+  if [ ! -f "scripts/first_run.flag" ]; then
+    echo "🛠️ Primeira execução detectada. Criando scripts PowerShell..."
 
-  # Script PowerShell que agenda o script principal no login
-  cat <<EOF > scripts/parsec_setup.ps1
+    EMAIL=$(head -n 1 "$TMP_SECRET_FILE")
+    PASSWORD=$(tail -n 1 "$TMP_SECRET_FILE")
+
+    cat <<EOF > scripts/parsec_setup.ps1
 \$taskName = "ParsecAutoLogin"
 \$task = schtasks /Query /TN \$taskName 2>&1
 if (\$task -like "*ERROR*") {
-    \$script = "C:\\parsecsetup\\parsec_run.ps1"
+    \$script = "C:\\\\parsecsetup\\\\parsec_run.ps1"
     schtasks /Create /TN \$taskName /TR "powershell -ExecutionPolicy Bypass -File \$script" /SC ONLOGON /RL HIGHEST /F /RU MASTER
 }
 EOF
 
-  # Script PowerShell principal que instala Parsec e faz login
-  cat <<EOF > scripts/parsec_run.ps1
-Invoke-WebRequest -Uri "https://builds.parsec.app/package/parsec-windows.exe" -OutFile "C:\\Users\\MASTER\\Downloads\\parsec.exe"
-Start-Process "C:\\Users\\MASTER\\Downloads\\parsec.exe" -ArgumentList "/S" -Wait
+    cat <<EOF > scripts/parsec_run.ps1
+Invoke-WebRequest -Uri "https://builds.parsec.app/package/parsec-windows.exe" -OutFile "C:\\\\Users\\\\MASTER\\\\Downloads\\\\parsec.exe"
+Start-Process "C:\\\\Users\\\\MASTER\\\\Downloads\\\\parsec.exe" -ArgumentList "/S" -Wait
 Start-Sleep -Seconds 10
-Start-Process "C:\\Program Files\\Parsec\\parsec.exe"
+Start-Process "C:\\\\Program Files\\\\Parsec\\\\parsec.exe"
 Start-Sleep -Seconds 8
-Start-Process "C:\\Program Files\\Parsec\\parsec.exe" -ArgumentList "login $PARSEC_EMAIL $PARSEC_PASSWORD"
-Write-Host "✅ Parsec instalado e login enviado. Confirme o e-mail de localização se solicitado."
+Start-Process "C:\\\\Program Files\\\\Parsec\\\\parsec.exe" -ArgumentList "login $EMAIL $PASSWORD"
+Write-Host "✅ Parsec instalado e login enviado. Confirme o e-mail se solicitado."
 EOF
 
-  # Limpar todos os aplicativos de startup, exceto Parsec
-  Write-Host "Removendo aplicativos de startup..."
+    cat <<EOF > scripts/clear_startup.ps1
+\$startupFolder = [System.Environment]::GetFolderPath("Startup")
+\$startupItems = Get-ChildItem -Path \$startupFolder
+foreach (\$item in \$startupItems) {
+    Remove-Item \$item.FullName -Force
+}
 
-  # Desabilita todos os itens de startup
-  \$startupFolder = [System.Environment]::GetFolderPath("Startup")
-  \$startupItems = Get-ChildItem -Path \$startupFolder
-  foreach (\$item in \$startupItems) {
-      Remove-Item \$item.FullName -Force
+\$regPaths = @(
+  "HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",
+  "HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run"
+)
+
+foreach (\$regPath in \$regPaths) {
+  \$items = Get-ItemProperty -Path \$regPath
+  foreach (\$item in \$items.PSObject.Properties) {
+    if (\$item.Name -ne "Parsec") {
+      Remove-ItemProperty -Path \$regPath -Name \$item.Name -Force
+    }
   }
+}
+EOF
 
-  # Remover outras entradas do registro (se houver)
-  $regPaths = @(
-      "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
-      "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
-  )
-
-  foreach ($regPath in $regPaths) {
-      $items = Get-ItemProperty -Path $regPath
-      foreach ($item in $items.PSObject.Properties) {
-          if ($item.Name -ne "Parsec") {
-              Remove-ItemProperty -Path $regPath -Name $item.Name -Force
-          }
-      }
-  }
-
-  Write-Host "✅ Todos os itens de startup removidos, exceto Parsec."
-
-  # Criar o arquivo de flag para marcar que já foi a primeira execução
-  touch /parsecsetup/first_run.flag
-
-  # Reiniciar a máquina automaticamente
-  Write-Host "Reiniciando a máquina..."
-  Restart-Computer -Force
+    touch scripts/first_run.flag
+    echo "♻️ Reiniciando sistema para aplicar as configurações..."
+    systemctl reboot
+  fi
 fi
 
-# Sobe o container
-docker-compose -f windows10.yml up -d
+# Sobe o container (caso ainda não esteja rodando)
+if ! docker ps --format '{{.Names}}' | grep -q "^windows$"; then
+  echo "🚀 Subindo container Windows..."
+  docker-compose -f windows10.yml up -d
+else
+  echo "ℹ️ Container 'windows' já está rodando."
+fi
 
-# Fim
+# Limpa arquivos temporários
+rm -f "$TMP_SECRET_FILE"
+
+# Mensagem final
 echo
-echo "✅ Container Windows criado com:"
+echo "✅ Ambiente Windows criado com sucesso:"
 echo "   🧠 RAM: $RAM_SIZE"
-echo "   ⚙️  Núcleos: $CPU_CORES"
-echo "✅ Parsec instalado e login agendado para rodar automaticamente"
-echo "✅ A máquina será reiniciada automaticamente após a configuração"
-echo "📡 Conecte via Parsec para começar a usar"
+echo "   ⚙️  CPU: $CPU_CORES núcleos"
 echo "👤 Usuário: MASTER | Senha: admin@123"
-echo "📁 Scripts acessíveis em: C:\\parsecsetup"
-echo
+echo "📁 Scripts disponíveis em C:\\parsecsetup"
+echo "📡 Acesse via Parsec após o boot"
+echo "📝 Log disponível em: $(realpath $LOG_FILE)"
